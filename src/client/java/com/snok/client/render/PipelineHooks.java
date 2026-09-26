@@ -1,6 +1,7 @@
 package com.snok.client.render;
 
 import com.snok.client.VerdiumuimClient;
+import com.snok.client.gl.GlProbe;
 import com.snok.config.VerdConfig;
 import com.snok.log.PerfLog;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
@@ -11,8 +12,8 @@ import org.joml.Vector3f;
 
 /**
  * Frame hooks: drain meshed sections into the store, reload GPU data when it
- * changed, issue the single MDI draw after entities, and render sun beams.
- * All hooks no-op when the pipeline is disabled or GL-unsupported.
+ * changed, and issue the batch draw after entities. Dispatches to the MODERN
+ * (MDI) renderer or the LEGACY (GL 3.3 instanced) renderer by GL tier.
  */
 public final class PipelineHooks {
 	private PipelineHooks() {
@@ -23,22 +24,11 @@ public final class PipelineHooks {
 	}
 
 	private static void onAfterEntities(WorldRenderContext ctx) {
-		ChunkBatchRenderer renderer = VerdiumuimClient.batchRenderer();
 		SectionStore store = VerdiumuimClient.sectionStore();
-		if (renderer == null || store == null || !renderer.isEnabled()) return;
+		if (store == null) return;
 
-		// 1. Fold worker results into the visible store.
 		store.drainUpdates();
 
-		// 2. Reload GPU mirror when new meshes committed.
-		if (store.hasNewCommits()) {
-			renderer.reloadFromStore(store);
-			store.clearNewCommitFlag();
-		}
-
-		// 3. Camera + matrices. The optimized batch draws slightly above the
-		//    vanilla terrain (tiny Y offset) so it is visible while vanilla
-		//    suppression is not yet enabled.
 		CameraRenderState cam = ctx.worldState().cameraRenderState;
 		if (cam == null || cam.pos == null) return;
 
@@ -52,14 +42,23 @@ public final class PipelineHooks {
 		Matrix4f proj = VerdiumuimClient.lastProjection();
 		if (proj == null) return;
 
-		// 4. The one draw call.
-		float maxDist = VerdConfig.get().lodSinkDistance * 2.0f;
-		renderer.renderBatch(view, proj, camX, camY, camZ, maxDist * maxDist);
-
-		// 5. Sun beams.
-		SunBeamRenderer beams = VerdiumuimClient.sunBeams();
-		if (beams != null && VerdConfig.get().sunBeams) {
-			beams.render(ctx, proj);
+		if (GlProbe.modernPipeline()) {
+			ChunkBatchRenderer renderer = VerdiumuimClient.batchRenderer();
+			if (renderer == null || !renderer.isEnabled()) return;
+			if (store.hasNewCommits()) {
+				renderer.reloadFromStore(store);
+				store.clearNewCommitFlag();
+			}
+			renderer.renderBatch(view, proj, camX, camY, camZ,
+					VerdConfig.get().lodSinkDistance * 2.0f);
+		} else {
+			LegacyBatchRenderer legacy = VerdiumuimClient.legacyRenderer();
+			if (legacy == null || !legacy.isEnabled()) return;
+			if (store.hasNewCommits()) {
+				legacy.reloadFromStore(store);
+				store.clearNewCommitFlag();
+			}
+			legacy.renderBatch(view, proj);
 		}
 	}
 

@@ -10,16 +10,22 @@ import org.slf4j.LoggerFactory;
 import static org.lwjgl.opengl.GL43.*;
 
 /**
- * One-time capability probe. MDI + SSBO paths require OpenGL 4.3+;
- * anything below (common on old Intel iGPUs) flips the config into
- * permanent vanilla fallback so the game keeps running.
+ * One-time capability probe. Classifies the GPU into one of three tiers:
+ *
+ *  - MODERN (GL 4.3+): MDI batching + SSBOs + gl_DrawID - the full pipeline.
+ *  - LEGACY (GL 3.3+): greedy meshing + packed quads + single-draw batching
+ *    via instanced attributes and a texture buffer; no MDI/SSBO needed.
+ *  - FALLBACK (below 3.3): vanilla rendering, mod stays non-intrusive.
  */
 public final class GlProbe {
+	public enum Tier { MODERN, LEGACY, FALLBACK }
+
 	private static final Logger LOG = LoggerFactory.getLogger("Verdiumuim/GL");
-	private static boolean probed = false;
-	private static boolean mdiSupported = false;
-	private static boolean ssboSupported = false;
-	private static boolean debugSupported = false;
+	private static boolean probed;
+	private static Tier tier = Tier.FALLBACK;
+	private static String glVersion = "unknown";
+	private static String glRenderer = "unknown";
+	private static int glMajor, glMinor;
 
 	private GlProbe() {
 	}
@@ -29,37 +35,59 @@ public final class GlProbe {
 		probed = true;
 
 		GLCapabilities caps = GL.getCapabilities();
-		String renderer = glGetString(GL_RENDERER);
-		String version = glGetString(GL_VERSION);
-		LOG.info("GL probe: {} on {}", renderer, version);
+		glRenderer = glGetString(GL_RENDERER);
+		glVersion = glGetString(GL_VERSION);
+		parseVersion(glVersion);
+		LOG.info("GL probe: {} | OpenGL {} ({}.{}-tier detection)", glRenderer, glVersion, glMajor, glMinor);
 
-		mdiSupported = caps.OpenGL43 || caps.GL_ARB_multi_draw_indirect;
-		ssboSupported = caps.OpenGL43 || caps.GL_ARB_shader_storage_buffer_object;
+		boolean mdi = caps.OpenGL43 || caps.GL_ARB_multi_draw_indirect;
+		boolean ssbo = caps.OpenGL43 || caps.GL_ARB_shader_storage_buffer_object;
 		// gl_DrawID comes from a separate extension; some 3.3-era Intel drivers
-		// expose MDI/SSBO ARBs but not this one, so check it explicitly.
-		boolean drawIdSupported = caps.OpenGL43 || caps.GL_ARB_shader_draw_parameters;
-		debugSupported = !VerdConfig.get().disableGlDebug && caps.GL_KHR_debug;
+		// expose MDI/SSBO ARBs but not this one.
+		boolean drawId = caps.OpenGL43 || caps.GL_ARB_shader_draw_parameters;
+		boolean gl33 = caps.OpenGL33 || (caps.GL_ARB_instanced_arrays && glMajor >= 3);
 
-		PerfLog.info(PerfLog.Cat.SHADERS, "caps: mdi=%s ssbo=%s khr_debug=%s",
-				mdiSupported, ssboSupported, debugSupported);
+		if (mdi && ssbo && drawId) {
+			tier = Tier.MODERN;
+			LOG.info("Pipeline tier: MODERN (MDI + SSBO batching available)");
+		} else if (gl33) {
+			tier = Tier.LEGACY;
+			LOG.info("Pipeline tier: LEGACY - GL {}.{} detected; greedy meshing + single-draw batching enabled, "
+					+ "MDI/SSBO path unavailable", glMajor, glMinor);
+		} else {
+			tier = Tier.FALLBACK;
+			LOG.warn("OpenGL 3.3 not available (detected {}.{}), vanilla render fallback active", glMajor, glMinor);
+		}
 
-		if (!mdiSupported || !ssboSupported || !drawIdSupported) {
-			VerdConfig.get().glFallback = true;
-			LOG.warn("OpenGL 4.3 pipeline unavailable (mdi={} ssbo={} gl_DrawID={}) - vanilla render fallback active. "
-					+ "On Intel iGPUs, updated drivers or Linux/Mesa (GL 4.5+) enable the optimized path.",
-				mdiSupported, ssboSupported, drawIdSupported);
+		PerfLog.info(PerfLog.Cat.SHADERS, "caps: mdi=%s ssbo=%s gl_DrawID=%s gl33=%s tier=%s",
+				mdi, ssbo, drawId, gl33, tier);
+		VerdConfig.get().glFallback = tier == Tier.FALLBACK;
+	}
+
+	private static void parseVersion(String v) {
+		try {
+			String[] parts = v.split(" ")[0].split("\\.");
+			glMajor = Integer.parseInt(parts[0]);
+			glMinor = Integer.parseInt(parts[1]);
+		} catch (Exception e) {
+			glMajor = 0;
+			glMinor = 0;
 		}
 	}
 
-	public static boolean mdiSupported() {
-		return mdiSupported;
+	public static Tier tier() {
+		return tier;
 	}
 
-	public static boolean ssboSupported() {
-		return ssboSupported;
+	public static boolean modernPipeline() {
+		return tier == Tier.MODERN;
 	}
 
-	public static boolean debugEnabled() {
-		return debugSupported;
+	public static String glVersion() {
+		return glVersion;
+	}
+
+	public static String glRenderer() {
+		return glRenderer;
 	}
 }
