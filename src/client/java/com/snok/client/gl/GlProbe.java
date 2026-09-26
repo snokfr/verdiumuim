@@ -35,14 +35,19 @@ public final class GlProbe {
 
 		mdiSupported = caps.OpenGL43 || caps.GL_ARB_multi_draw_indirect;
 		ssboSupported = caps.OpenGL43 || caps.GL_ARB_shader_storage_buffer_object;
+		// gl_DrawID comes from a separate extension; some 3.3-era Intel drivers
+		// expose MDI/SSBO ARBs but not this one, so check it explicitly.
+		boolean drawIdSupported = caps.OpenGL43 || caps.GL_ARB_shader_draw_parameters;
 		debugSupported = !VerdConfig.get().disableGlDebug && caps.GL_KHR_debug;
 
 		PerfLog.info(PerfLog.Cat.SHADERS, "caps: mdi=%s ssbo=%s khr_debug=%s",
 				mdiSupported, ssboSupported, debugSupported);
 
-		if (!mdiSupported || !ssboSupported) {
+		if (!mdiSupported || !ssboSupported || !drawIdSupported) {
 			VerdConfig.get().glFallback = true;
-			LOG.warn("OpenGL 4.3 not available (mdi={} ssbo={}) - vanilla render fallback active", mdiSupported, ssboSupported);
+			LOG.warn("OpenGL 4.3 pipeline unavailable (mdi={} ssbo={} gl_DrawID={}) - vanilla render fallback active. "
+					+ "On Intel iGPUs, updated drivers or Linux/Mesa (GL 4.5+) enable the optimized path.",
+				mdiSupported, ssboSupported, drawIdSupported);
 		}
 	}
 
