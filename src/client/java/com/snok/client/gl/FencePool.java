@@ -37,8 +37,9 @@ public final class FencePool {
 			buffers[i] = glCreateBuffers();
 			glNamedBufferStorage(buffers[i], slotBytes,
 					GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
-			maps[i] = glMapNamedBufferRange(buffers[i], 0, slotBytes,
+			java.nio.ByteBuffer mapped = glMapNamedBufferRange(buffers[i], 0, slotBytes,
 					GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+			maps[i] = MemoryUtil.memAddress(mapped);
 			fences[i] = 0;
 			sizes[i] = 0;
 			PerfLog.info(PerfLog.Cat.BUFFERS, "staging slot %d: %d bytes persistent-mapped", i, slotBytes);
@@ -88,6 +89,7 @@ public final class FencePool {
 			if (maps[i] != 0) glUnmapNamedBuffer(buffers[i]);
 			glDeleteBuffers(buffers[i]);
 		}
+		// Persistent maps live for the buffer lifetime; explicit free is not needed.
 		java.util.Arrays.fill(maps, 0);
 		java.util.Arrays.fill(fences, 0);
 	}

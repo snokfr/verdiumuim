@@ -15,8 +15,8 @@ import static org.lwjgl.opengl.GL15.*;
 import static org.lwjgl.opengl.GL20.glEnableVertexAttribArray;
 import static org.lwjgl.opengl.GL20.glVertexAttribPointer;
 import static org.lwjgl.opengl.GL30.*;
-import static org.lwjgl.opengl.GL31.GL_DRAW_INDIRECT_BUFFER;
 import static org.lwjgl.opengl.GL33.glVertexAttribDivisor;
+import static org.lwjgl.opengl.GL40.GL_DRAW_INDIRECT_BUFFER;
 import static org.lwjgl.opengl.GL40.GL_DRAW_INDIRECT_BUFFER_BINDING;
 import static org.lwjgl.opengl.GL43.*;
 
