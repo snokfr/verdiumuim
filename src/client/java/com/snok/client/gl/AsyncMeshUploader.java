@@ -1,37 +1,39 @@
 package com.snok.client.gl;
 
+import com.snok.config.VerdConfig;
 import com.snok.log.PerfLog;
+import com.snok.mesh.GreedyMesher;
 import org.lwjgl.system.MemoryUtil;
 
-import java.nio.ByteBuffer;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.lwjgl.opengl.GL45.glCopyNamedBufferSubData;
-import static org.lwjgl.opengl.GL45.glBindBuffer;
-import static org.lwjgl.opengl.GL31.GL_COPY_WRITE_BUFFER;
-
 /**
- * Worker-thread mesh transfer pipeline. Meshing jobs produce packed quad data
- * on background threads, land in a staging slot from the FencePool, and the
- * render thread drains finished slots each frame with zero-wait fence checks.
- *
- * GL calls happen only on the render thread; the worker only touches raw
- * memory (the persistent map) and hands over via a queue.
+ * Worker-thread mesh transfer pipeline. The render thread (or mixin worker
+ * threads) submit opaque masks; this worker greedy-meshes them and hands the
+ * packed quads to the callback. The render thread drains finished staging
+ * slots each frame with zero-wait fence checks.
  */
 public final class AsyncMeshUploader {
-	/** A mesh job ready to be written into a staging slot. */
-	public record MeshJob(long sectionKey, ByteBuffer data) {
+	/** Section mesh request: opaque mask + world origin of the section. */
+	public record MeshJob(long key, int originX, int originY, int originZ, boolean[] mask) {
 	}
 
-	private final BlockingQueue<MeshJob> queue = new ArrayBlockingQueue<>(256);
+	/** Receives meshed packed-quad arrays on the worker thread. */
+	public interface MeshedCallback {
+		void onMeshed(long key, int originX, int originY, int originZ, int[] quads);
+	}
+
+	private final BlockingQueue<MeshJob> queue = new ArrayBlockingQueue<>(512);
 	private final AtomicBoolean running = new AtomicBoolean(true);
 	private final Thread worker;
 	private final FencePool pool;
+	private final MeshedCallback onMeshed;
 
-	public AsyncMeshUploader(FencePool pool) {
+	public AsyncMeshUploader(FencePool pool, MeshedCallback onMeshed) {
 		this.pool = pool;
+		this.onMeshed = onMeshed;
 		this.worker = new Thread(this::run, "Verdiumuim-MeshWorker");
 		this.worker.setDaemon(true);
 		this.worker.start();
@@ -40,7 +42,7 @@ public final class AsyncMeshUploader {
 	/** Called from any thread; drops the oldest job if the queue is full. */
 	public void submit(MeshJob job) {
 		while (!queue.offer(job)) {
-			queue.poll(); // shed load rather than back up meshing behind the GPU
+			queue.poll(); // shed load rather than back up behind the GPU
 		}
 	}
 
@@ -48,20 +50,10 @@ public final class AsyncMeshUploader {
 		while (running.get()) {
 			try {
 				MeshJob job = queue.take();
-				int slot = pool.acquireSlot();
-				if (slot < 0) {
-					// Ring saturated: retry after letting one drain.
-					Thread.yield();
-					slot = pool.acquireSlot();
-					if (slot < 0) continue;
-				}
-				long map = pool.map(slot);
-				if (map == 0) continue;
-				ByteBuffer dst = MemoryUtil.memByteBuffer(map, (int) job.data().capacity());
-				dst.put(job.data());
-				pool.sealSlot(slot, job.data().capacity());
-				PerfLog.info(PerfLog.Cat.BUFFERS, "uploaded section %d (%d bytes) via slot %d",
-						job.sectionKey(), job.data().capacity(), slot);
+				boolean greedy = VerdConfig.get().greedyMeshing;
+				int[] quads = GreedyMesher.mesh(job.mask(), greedy);
+				onMeshed.onMeshed(job.key(), job.originX(), job.originY(), job.originZ(), quads);
+				PerfLog.info(PerfLog.Cat.RENDERER, "meshed section %d -> %d packed quads", job.key(), quads.length);
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				return;
@@ -71,10 +63,8 @@ public final class AsyncMeshUploader {
 		}
 	}
 
-	/** Render-thread call once per frame: no blocking, just fence checks inside the pool. */
+	/** Render-thread call once per frame: zero-wait fence checks in the pool. */
 	public void drainCompleted() {
-		// FencePool.acquireSlot is called opportunistically by the worker;
-		// this hook exists so the render thread can run stats + reclaim logic.
 		PerfLog.info(PerfLog.Cat.BUFFERS, "drain tick, queued=%d", queue.size());
 	}
 

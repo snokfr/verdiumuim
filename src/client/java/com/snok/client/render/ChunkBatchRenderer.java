@@ -1,176 +1,234 @@
 package com.snok.client.render;
 
+import com.snok.client.gl.ShaderProgram;
 import com.snok.config.VerdConfig;
 import com.snok.log.PerfLog;
 import com.snok.mesh.PackedQuad;
+import org.joml.Matrix4f;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.system.MemoryUtil;
 
-import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.lwjgl.opengl.GL11.GL_UNSIGNED_INT;
 import static org.lwjgl.opengl.GL15.*;
-import static org.lwjgl.opengl.GL20.glEnableVertexAttribArray;
-import static org.lwjgl.opengl.GL20.glVertexAttribPointer;
+import static org.lwjgl.opengl.GL20.*;
 import static org.lwjgl.opengl.GL30.*;
-import static org.lwjgl.opengl.GL33.glVertexAttribDivisor;
 import static org.lwjgl.opengl.GL40.GL_DRAW_INDIRECT_BUFFER;
-import static org.lwjgl.opengl.GL40.GL_DRAW_INDIRECT_BUFFER_BINDING;
 import static org.lwjgl.opengl.GL43.*;
 
 /**
- * Single-command terrain batch. All sections live in one VAO:
- *
- *  - VBO: packed quads (one int per merged face)
- *  - Per-quad attributes: vertexID (corner index), quadIndex (gl_InstanceID
- *    drives expansion in the vertex shader - see terrain.vert)
- *  - EBO: triangle-strip restart indices (4 verts/quad, restart between)
- *  - Indirect buffer: DrawElementsIndirectCommand array, one entry per
- *    visible section; a single glMultiDrawElementsIndirect draws everything
- *  - SSBO 0: per-section world origin + sink offset, indexed by gl_DrawID
- *
- * Intel-friendly properties: one VAO bind, one MDI call, no per-section GL
- * state changes, no mid-frame mapping.
+ * Single-command terrain batch. One VAO; per-frame section commands + origins
+ * + quads go into SSBO 0 / an indirect buffer; one glMultiDrawElementsIndirect
+ * draws every visible section as 4-vertex triangle strips expanded
+ * procedurally in terrain.vert.
  */
 public final class ChunkBatchRenderer {
-	/** gl_DrawID -> world origin (3 ints) + sink offset (1 float). */
 	public static final int SECTION_SSBO_BINDING = 0;
-	private static final int INITIAL_SECTIONS = 4096;
-	private static final int COMMAND_INTS = 5; // count, instanceCount, firstIndex, baseVertex, baseInstance
+	private static final int COMMAND_INTS = 5;
 
 	private int vao;
-	private int vbo;      // packed quads
-	private int ebo;      // strip indices
-	private int indirect; // MDI command array
-	private int sectionSsbo;
+	private int ebo;
+	private int indirect;
+	private ShaderProgram program;
 
-	private int sectionCapacity = INITIAL_SECTIONS;
+	private int sectionCapacity = 4096;
 	private int quadCapacity = 1 << 16;
 
-	/** CPU-side mirror for building the frame's command list. */
-	private final List<SectionDraw> visibleSections = new ArrayList<>(2048);
+	/** Committed GPU mirror, rebuilt from the store when meshes change. */
+	private List<CommittedSection> committed = new ArrayList<>();
+	private IntBuffer quadMirror = MemoryUtil.memAllocInt(4096);
+	private int totalQuads = 0;
+	private boolean dirty = true;
 
-	public record SectionDraw(long sectionKey, int firstQuad, int quadCount,
-	                          int worldX, int worldY, int worldZ, float sinkOffset) {
+	private static final class CommittedSection {
+		final int firstQuad;
+		final int quadCount;
+		final int worldX, worldY, worldZ;
+		final float sinkOffset;
+
+		CommittedSection(int firstQuad, int quadCount, int x, int y, int z, float sink) {
+			this.firstQuad = firstQuad;
+			this.quadCount = quadCount;
+			this.worldX = x;
+			this.worldY = y;
+			this.worldZ = z;
+			this.sinkOffset = sink;
+		}
 	}
 
-	private final ByteBuffer cmdBuffer = MemoryUtil.memAlloc(INITIAL_SECTIONS * COMMAND_INTS * 4);
-	private final ByteBuffer ssboBuffer = MemoryUtil.memAlloc(INITIAL_SECTIONS * 16);
+	private final FloatBuffer matBuf = BufferUtils.createFloatBuffer(16);
 
 	public ChunkBatchRenderer() {
 		vao = glGenVertexArrays();
 		glBindVertexArray(vao);
 
-		vbo = glGenBuffers();
-		glBindBuffer(GL_ARRAY_BUFFER, vbo);
-		glBufferData(GL_ARRAY_BUFFER, (long) quadCapacity * PackedQuad.BYTES, GL_DYNAMIC_DRAW);
-
-		// Attribute 0: vertex corner id (procedural expansion in shader).
-		glEnableVertexAttribArray(0);
-		glVertexAttribPointer(0, 1, GL_INT, false, 4, 0);
-		glVertexAttribDivisor(0, 0);
-
 		ebo = glGenBuffers();
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-		buildStripIndexBuffer();
+		buildIdentityIndexBuffer();
 
 		indirect = glGenBuffers();
 		glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect);
 		glBufferData(GL_DRAW_INDIRECT_BUFFER, (long) sectionCapacity * COMMAND_INTS * 4, GL_DYNAMIC_DRAW);
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirect);
+		glBufferData(GL_SHADER_STORAGE_BUFFER, ssboBytes(sectionCapacity), GL_DYNAMIC_DRAW);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, SECTION_SSBO_BINDING, indirect);
 
-		sectionSsbo = glGenBuffers();
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, sectionSsbo);
-		glBufferData(GL_SHADER_STORAGE_BUFFER, (long) sectionCapacity * 16, GL_DYNAMIC_DRAW);
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, SECTION_SSBO_BINDING, sectionSsbo);
+		program = new ShaderProgram("terrain", loadShader("terrain.vert"), loadShader("terrain.frag"));
 
 		glBindVertexArray(0);
-		PerfLog.info(PerfLog.Cat.BUFFERS, "batch renderer ready: vao=%d quadCap=%d sectionCap=%d",
-				vao, quadCapacity, sectionCapacity);
+		PerfLog.info(PerfLog.Cat.BUFFERS, "batch renderer ready: quadCap=%d sectionCap=%d",
+				quadCapacity, sectionCapacity);
 	}
 
-	/** Strip index pattern: 0,1,2,3, RESTART, per quad. */
-	private void buildStripIndexBuffer() {
-		IntBuffer idx = MemoryUtil.memAllocInt(quadCapacity * 5);
-		for (int q = 0; q < quadCapacity; q++) {
-			int base = q * 4;
-			idx.put(base).put(base + 1).put(base + 2).put(base + 3).put(0xFFFFFFFF);
-		}
+	private static long ssboBytes(int cap) {
+		return (long) (cap + 1) * 16 + (long) cap * 2 * PackedQuad.BYTES * 2;
+	}
+
+	private void buildIdentityIndexBuffer() {
+		IntBuffer idx = MemoryUtil.memAllocInt(quadCapacity * 4);
+		for (int i = 0; i < quadCapacity * 4; i++) idx.put(i);
 		idx.flip();
-		glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx, GL_DYNAMIC_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx, GL_STATIC_DRAW);
 		MemoryUtil.memFree(idx);
 	}
 
-	public void addSection(SectionDraw draw) {
-		visibleSections.add(draw);
+	private static String loadShader(String file) {
+		try (var in = ChunkBatchRenderer.class.getResourceAsStream("/assets/verdiumuim/shaders/" + file)) {
+			return new String(in.readAllBytes());
+		} catch (Exception e) {
+			throw new IllegalStateException("missing shader " + file, e);
+		}
 	}
 
-	/** Upload command + SSBO arrays and issue the single MDI draw. */
-	public void renderBatch() {
-		int n = visibleSections.size();
-		if (n == 0) return;
-		if (n > sectionCapacity) growSectionCapacity(n);
+	/** Mark GPU data stale; next renderBatch reloads from the store. */
+	public void markDirty() {
+		dirty = true;
+	}
 
-		cmdBuffer.clear();
-		ssboBuffer.clear();
-		long totalQuads = 0;
-		for (int i = 0; i < n; i++) {
-			SectionDraw s = visibleSections.get(i);
-			cmdBuffer.putInt(s.quadCount() * PackedQuad.VERTS) // count (indices)
-					.putInt(1)                                  // instanceCount
-					.putInt(s.firstQuad() * 5)                  // firstIndex (strip pattern stride)
-					.putInt(s.firstQuad() * 4)                  // baseVertex
-					.putInt(0);                                 // baseInstance
-			ssboBuffer.putInt(s.worldX()).putInt(s.worldY()).putInt(s.worldZ());
-			ssboBuffer.putFloat(s.sinkOffset());
-			totalQuads += s.quadCount();
+	/** Rebuild the CPU mirror of committed sections from the store. */
+	public void reloadFromStore(SectionStore store) {
+		if (!dirty) return;
+
+		List<CommittedSection> next = new ArrayList<>(store.size());
+		int neededQuads = Math.max(4096, store.approxQuadCount() * 2);
+		if (quadMirror.capacity() < neededQuads) {
+			MemoryUtil.memFree(quadMirror);
+			quadMirror = MemoryUtil.memAllocInt(neededQuads);
 		}
-		cmdBuffer.flip();
-		ssboBuffer.flip();
+		quadMirror.clear();
+		totalQuads = 0;
+
+		store.forEachMesh((key, mesh) -> {
+			if (mesh.quads().length == 0) return;
+			int firstQuad = totalQuads;
+			for (int packed : mesh.quads()) {
+				if (quadMirror.remaining() < 1) return;
+				quadMirror.put(packed);
+				totalQuads++;
+			}
+			next.add(new CommittedSection(firstQuad, mesh.quads().length,
+					mesh.originX(), mesh.originY(), mesh.originZ(), mesh.sinkOffset()));
+		});
+		committed = next;
+		dirty = false;
+		PerfLog.info(PerfLog.Cat.RENDERER, "committed %d sections / %d quads to GPU mirror",
+				committed.size(), totalQuads);
+	}
+
+	/**
+	 * Upload visible-section commands + SSBO data and issue the single MDI
+	 * draw. Returns sections drawn.
+	 */
+	public int renderBatch(Matrix4f view, Matrix4f proj, float camX, float camY, float camZ, float maxDistSq) {
+		if (committed.isEmpty()) return 0;
+
+		// Distance cull into the frame list.
+		List<CommittedSection> visible = new ArrayList<>(committed.size());
+		for (CommittedSection s : committed) {
+			float dx = s.worldX + 8 - camX;
+			float dy = s.worldY + 8 - camY;
+			float dz = s.worldZ + 8 - camZ;
+			if (dx * dx + dy * dy + dz * dz <= maxDistSq) visible.add(s);
+		}
+		int n = visible.size();
+		if (n == 0) return 0;
+		if (n > sectionCapacity) growSections(n);
+
+		// Build SSBO: header, section records, quads of visible sections.
+		int visQuads = 0;
+		for (CommittedSection s : visible) visQuads += s.quadCount;
+
+		IntBuffer ssbo = MemoryUtil.memAllocInt(4 + n * 4 + visQuads * 4);
+		ssbo.put(n).put(0).put(0).put(0);
+		for (CommittedSection s : visible) {
+			ssbo.put(s.worldX).put(s.worldY).put(s.worldZ);
+			ssbo.put(Float.floatToRawIntBits(s.sinkOffset));
+		}
+		// Emit quads with visible-local section ids.
+		int visIdx = 0;
+		for (CommittedSection s : visible) {
+			for (int q = 0; q < s.quadCount; q++) {
+				ssbo.put(visIdx);
+				ssbo.put(quadMirror.get(s.firstQuad + q));
+			}
+			visIdx++;
+		}
+		ssbo.flip();
+
+		IntBuffer cmds = MemoryUtil.memAllocInt(n * COMMAND_INTS);
+		int quadCursor = 0;
+		for (CommittedSection s : visible) {
+			cmds.put(s.quadCount * 4)   // count: 4 verts per quad
+					.put(1)                  // instanceCount
+					.put(0)                  // firstIndex
+					.put(quadCursor * 4)     // baseVertex
+					.put(0);                 // baseInstance
+			quadCursor += s.quadCount;
+		}
+		cmds.flip();
+
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirect);
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, SECTION_SSBO_BINDING, indirect);
 
 		glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect);
-		glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, cmdBuffer);
-
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, sectionSsbo);
-		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, ssboBuffer);
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, SECTION_SSBO_BINDING, sectionSsbo);
+		glBufferSubData(GL_DRAW_INDIRECT_BUFFER, 0, cmds);
 
 		glBindVertexArray(vao);
-		glEnable(GL_PRIMITIVE_RESTART);
-		glPrimitiveRestartIndex(0xFFFFFFFF);
+		program.use();
+		matBuf.clear();
+		view.get(matBuf);
+		matBuf.flip();
+		glUniformMatrix4fv(program.uniform("uView"), false, matBuf);
+		matBuf.clear();
+		proj.get(matBuf);
+		matBuf.flip();
+		glUniformMatrix4fv(program.uniform("uProj"), false, matBuf);
+
+		glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
 		glMultiDrawElementsIndirect(GL_TRIANGLE_STRIP, GL_UNSIGNED_INT, 0, n, 0);
-		glDisable(GL_PRIMITIVE_RESTART);
+		glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+		glBindVertexArray(0);
 
-		PerfLog.info(PerfLog.Cat.RENDERER, "MDI batch: %d sections, %d quads, 1 draw call", n, totalQuads);
+		MemoryUtil.memFree(ssbo);
+		MemoryUtil.memFree(cmds);
+
+		PerfLog.info(PerfLog.Cat.RENDERER, "MDI batch: %d sections, %d quads, 1 draw call", n, visQuads);
+		return n;
 	}
 
-	public void clearFrame() {
-		visibleSections.clear();
-	}
-
-	private void growSectionCapacity(int min) {
-		int newCap = Math.max(sectionCapacity * 2, min);
+	private void growSections(int min) {
+		sectionCapacity = Math.max(sectionCapacity * 2, min);
 		glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect);
-		glBufferData(GL_DRAW_INDIRECT_BUFFER, (long) newCap * COMMAND_INTS * 4, GL_DYNAMIC_DRAW);
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, sectionSsbo);
-		glBufferData(GL_SHADER_STORAGE_BUFFER, (long) newCap * 16, GL_DYNAMIC_DRAW);
-		sectionCapacity = newCap;
-		PerfLog.info(PerfLog.Cat.BUFFERS, "grew section capacity to %d", newCap);
-	}
-
-	/** Swap the packed-quad VBO contents (called from the async upload path). */
-	public void replaceQuadData(ByteBuffer data, int quadCount) {
-		if (quadCount > quadCapacity) {
-			quadCapacity = Math.max(quadCapacity * 2, quadCount);
-			glBindBuffer(GL_ARRAY_BUFFER, vbo);
-			glBufferData(GL_ARRAY_BUFFER, (long) quadCapacity * PackedQuad.BYTES, GL_DYNAMIC_DRAW);
-			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-			buildStripIndexBuffer();
-			PerfLog.info(PerfLog.Cat.BUFFERS, "grew quad capacity to %d", quadCapacity);
-		}
-		glBindBuffer(GL_ARRAY_BUFFER, vbo);
-		glBufferSubData(GL_ARRAY_BUFFER, 0, data);
+		glBufferData(GL_DRAW_INDIRECT_BUFFER, (long) sectionCapacity * COMMAND_INTS * 4, GL_DYNAMIC_DRAW);
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirect);
+		glBufferData(GL_SHADER_STORAGE_BUFFER, ssboBytes(sectionCapacity), GL_DYNAMIC_DRAW);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, SECTION_SSBO_BINDING, indirect);
+		PerfLog.info(PerfLog.Cat.BUFFERS, "grew section capacity to %d", sectionCapacity);
 	}
 
 	public boolean isEnabled() {
@@ -178,12 +236,11 @@ public final class ChunkBatchRenderer {
 	}
 
 	public void destroy() {
-		glDeleteVertexArrays(vao);
-		glDeleteBuffers(vbo);
-		glDeleteBuffers(ebo);
-		glDeleteBuffers(indirect);
-		glDeleteBuffers(sectionSsbo);
-		MemoryUtil.memFree(cmdBuffer);
-		MemoryUtil.memFree(ssboBuffer);
+		if (vao != 0) glDeleteVertexArrays(vao);
+		if (ebo != 0) glDeleteBuffers(ebo);
+		if (indirect != 0) glDeleteBuffers(indirect);
+		if (program != null) program.close();
+		vao = ebo = indirect = 0;
+		MemoryUtil.memFree(quadMirror);
 	}
 }
