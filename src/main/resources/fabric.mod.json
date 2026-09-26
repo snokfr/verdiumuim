@@ -2,24 +2,27 @@
 	"schemaVersion": 1,
 	"id": "verdiumuim",
 	"version": "${version}",
-	"name": "verdiumuim",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "Verdiumuim",
+	"description": "Intel GPU focused rendering optimizations: greedy meshing, single-command MDI batching, async mesh transfers, LOD sinking, and volumetric sun beams.",
 	"authors": [
-		"Me!"
+		"snok"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"homepage": "https://github.com/snok/verdiumuim",
+		"sources": "https://github.com/snok/verdiumuim"
 	},
 	"license": "CC0-1.0",
 	"icon": "assets/verdiumuim/icon.png",
-	"environment": "*",
+	"environment": "client",
 	"entrypoints": {
 		"main": [
 			"com.snok.Verdiumuim"
 		],
 		"client": [
 			"com.snok.client.VerdiumuimClient"
+		],
+		"modmenu": [
+			"com.snok.client.integration.VerdiumuimModMenu"
 		]
 	},
 	"mixins": [
@@ -34,5 +37,9 @@
 		"minecraft": "~1.21.11",
 		"java": ">=21",
 		"fabric-api": "*"
+	},
+	"suggests": {
+		"cloth-config2": "*",
+		"modmenu": "*"
 	}
 }
