@@ -155,6 +155,18 @@ public class VerdiumuimClient implements ClientModInitializer {
 		return SODIUM_PRESENT;
 	}
 
+	/**
+	 * True when vanilla chunk drawing should be skipped: config opt-in, a
+	 * healthy non-Sodium pipeline, and at least one meshed section ready so
+	 * the world never renders empty while meshes stream in.
+	 */
+	public static boolean shouldSuppressVanillaTerrain() {
+		if (!VerdConfig.get().suppressVanillaTerrain) return false;
+		if (SODIUM_PRESENT) return false;
+		if (VerdConfig.get().glFallback) return false;
+		return sectionStore != null && sectionStore.size() > 0;
+	}
+
 	public static Matrix4f lastProjection() {
 		return lastProjection;
 	}

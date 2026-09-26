@@ -29,6 +29,13 @@ public final class VerdConfig {
 	public boolean singleCommandBatching = true;
 	/** 4-vertex triangle strips + procedural corner generation in the vertex shader. */
 	public boolean triangleStrips = true;
+	/**
+	 * Skip vanilla chunk drawing entirely when the Verdiumuim pipeline is
+	 * active (the completed replacement). Off by default: translucent layers
+	 * (water, glass) are not yet covered by the optimized path, so enabling
+	 * this trades translucents for draw-call savings.
+	 */
+	public boolean suppressVanillaTerrain = false;
 
 	// ------------------------------------------------------------------
 	// Buffers

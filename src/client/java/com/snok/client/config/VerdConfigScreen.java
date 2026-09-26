@@ -52,6 +52,12 @@ public final class VerdConfigScreen {
 				.setDefaultValue(true)
 				.setSaveConsumer(v -> cfg.triangleStrips = v)
 				.build());
+		terrain.addEntry(eb.startBooleanToggle(Text.literal("Suppress vanilla terrain"), cfg.suppressVanillaTerrain)
+				.setTooltip(Text.literal("Skip vanilla chunk drawing entirely - Verdiumuim's batched pipeline fully replaces it. "
+						+ "Warning: translucent blocks (water, glass) still render vanilla; enabling this may hide them until v1.1."))
+				.setDefaultValue(false)
+				.setSaveConsumer(v -> cfg.suppressVanillaTerrain = v)
+				.build());
 
 		// ------------------------------------------------------------------
 		// Buffers
