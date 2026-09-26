@@ -1,0 +1,45 @@
+# Publishes an open-source GitHub Release with the mod + sources JARs
+# whenever a v* tag is pushed (e.g. v1.0.0).
+
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v6
+      - name: validate gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+      - name: setup jdk
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'microsoft'
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew
+      - name: build
+        run: ./gradlew build
+      - name: extract version
+        id: ver
+        run: echo "version=$(grep -oP '(?<=^version=).*' gradle.properties)" >> "$GITHUB_OUTPUT"
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Verdiumuim ${{ steps.ver.outputs.version }}
+          body: |
+            Verdiumuim ${{ steps.ver.outputs.version }} for Minecraft 1.21.11 (Fabric).
+
+            Requires: Fabric Loader >= 0.19.5, Fabric API, Java 21.
+            Optional: Cloth Config + Mod Menu for the in-game config screen.
+          files: |
+            build/libs/*.jar
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
