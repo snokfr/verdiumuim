@@ -40,16 +40,15 @@ public final class GlProbe {
 		parseVersion(glVersion);
 		LOG.info("GL probe: {} | OpenGL {} ({}.{}-tier detection)", glRenderer, glVersion, glMajor, glMinor);
 
-		boolean mdi = caps.OpenGL43 || caps.GL_ARB_multi_draw_indirect;
-		boolean ssbo = caps.OpenGL43 || caps.GL_ARB_shader_storage_buffer_object;
-		// gl_DrawID comes from a separate extension; some 3.3-era Intel drivers
-		// expose MDI/SSBO ARBs but not this one.
-		boolean drawId = caps.OpenGL43 || caps.GL_ARB_shader_draw_parameters;
+		// Tier selection uses CORE versions only. Several Intel Windows drivers
+		// advertise ARB extension flags while their GLSL compiler rejects the
+		// corresponding built-ins (gl_DrawID etc.), so ARB promotion is untrustworthy.
+		boolean core43 = caps.OpenGL43;
 		boolean gl33 = caps.OpenGL33 || (caps.GL_ARB_instanced_arrays && glMajor >= 3);
 
-		if (mdi && ssbo && drawId) {
+		if (core43) {
 			tier = Tier.MODERN;
-			LOG.info("Pipeline tier: MODERN (MDI + SSBO batching available)");
+			LOG.info("Pipeline tier: MODERN (core GL 4.3: MDI + SSBO batching available)");
 		} else if (gl33) {
 			tier = Tier.LEGACY;
 			LOG.info("Pipeline tier: LEGACY - GL {}.{} detected; greedy meshing + single-draw batching enabled, "
@@ -59,8 +58,7 @@ public final class GlProbe {
 			LOG.warn("OpenGL 3.3 not available (detected {}.{}), vanilla render fallback active", glMajor, glMinor);
 		}
 
-		PerfLog.info(PerfLog.Cat.SHADERS, "caps: mdi=%s ssbo=%s gl_DrawID=%s gl33=%s tier=%s",
-				mdi, ssbo, drawId, gl33, tier);
+		PerfLog.info(PerfLog.Cat.SHADERS, "caps: core43=%s gl33=%s tier=%s", core43, gl33, tier);
 		VerdConfig.get().glFallback = tier == Tier.FALLBACK;
 	}
 

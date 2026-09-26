@@ -1,4 +1,5 @@
 #version 440 core
+#extension GL_ARB_shader_draw_parameters : enable
 
 // Terrain vertex shader. Vertex data lives entirely in SSBO 0; the EBO is an
 // identity passthrough so gl_VertexID == index, and corner order for the
@@ -50,14 +51,14 @@ void main() {
     uint sid = uint(gl_DrawID);
 
     uvec4 quadRec = sections[n + quadBase];
-    uint packed = quadRec.y;
+    uint pq = quadRec.y;
 
-    int x = int(packed & 0x3FFu);
-    int y = int((packed >> 10u) & 0x3FFu);
-    int z = int((packed >> 20u) & 0x3Fu);
-    uint dir = (packed >> 26u) & 0x7u;
-    int w = int((packed >> 28u) & 0x3u) + 1;
-    int h = int((packed >> 30u) & 0x3u) + 1;
+    int x = int(pq & 0x3FFu);
+    int y = int((pq >> 10u) & 0x3FFu);
+    int z = int((pq >> 20u) & 0x3Fu);
+    uint dir = (pq >> 26u) & 0x7u;
+    int w = int((pq >> 28u) & 0x3u) + 1;
+    int h = int((pq >> 30u) & 0x3u) + 1;
 
     // Expand the merged span in the face's plane.
     vec3 local;
